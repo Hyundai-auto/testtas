@@ -1,3 +1,12 @@
-node_modules
-.DS_Store
+__pycache__/
+*.py[cod]
+*$py.class
 .env
+.venv
+env/
+venv/
+ENV/
+.vscode/
+.idea/
+node_modules/
+.DS_Store
