@@ -17,6 +17,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+
+# Configuração de CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -28,9 +30,10 @@ app.add_middleware(
 # ============================================================
 # CONFIGURAÇÃO PUSHINPAY
 # ============================================================
-PUSHINPAY_SERVICE_URL = "https://app.pushinpay.com.br/service/pay/A1D84A4C-312D-4A77-A804-4134784C458D"
+PUSHINPAY_URLS = {
+    "default": "https://app.pushinpay.com.br/service/pay/A1D84A4C-312D-4A77-A804-4134784C458D"
+}
 
-# Tempo máximo (em segundos) que uma página pré-aquecida pode ficar no cache antes de ser descartada
 PAGE_MAX_AGE_SECONDS = 180
 
 class PixRequest(BaseModel):
@@ -41,10 +44,10 @@ class PixRequest(BaseModel):
     subtotal: str = None
 
 class PreWarmedPage:
-    """Armazena uma página pré-aquecida com timestamp de criação."""
-    def __init__(self, page, created_at: float):
+    def __init__(self, page, created_at: float, url: str):
         self.page = page
         self.created_at = created_at
+        self.url = url
 
     def is_expired(self) -> bool:
         import time
@@ -54,10 +57,7 @@ class PreWarmedPage:
         return not self.page.is_closed() and not self.is_expired()
 
 class BrowserManager:
-    """
-    Gerencia o Playwright com pool de páginas pré-aquecidas para a PushinPay.
-    """
-    def __init__(self, pool_size=2):
+    def __init__(self, pool_size=1): # Reduzido para 1 para economizar memória no Render
         self.playwright = None
         self.browser = None
         self.context = None
@@ -120,44 +120,37 @@ class BrowserManager:
         while len(self._warm_pages) < self.pool_size:
             await self._add_warm_page()
 
-    async def _add_warm_page(self):
+    async def _add_warm_page(self, url=None):
+        target_url = url or PUSHINPAY_URLS["default"]
         try:
-            page = await self._create_ready_page()
+            page = await self._create_ready_page(target_url)
             if page:
                 import time
-                self._warm_pages.append(PreWarmedPage(page, time.time()))
-                logger.info("Página PushinPay pré-aquecida adicionada")
+                self._warm_pages.append(PreWarmedPage(page, time.time(), target_url))
+                logger.info(f"Página pré-aquecida adicionada: {target_url}")
         except Exception as e:
             logger.error(f"Erro ao pré-aquecer: {e}")
 
-    async def _create_ready_page(self):
+    async def _create_ready_page(self, url):
         if not self.context: return None
         page = await self.context.new_page()
-        # Bloqueia recursos desnecessários
         async def block_resources(route):
             if route.request.resource_type in ["image", "font", "media"]:
                 return await route.abort()
             await route.continue_()
         await page.route("**/*", block_resources)
-        await page.goto(PUSHINPAY_SERVICE_URL, wait_until='domcontentloaded', timeout=30000)
-        # Aguarda os campos de input estarem prontos
-        try:
-            await page.wait_for_selector('input[name="name"]', timeout=15000)
-        except: pass
+        await page.goto(url, wait_until='domcontentloaded', timeout=30000)
         return page
 
-    async def get_ready_page(self):
+    async def get_ready_page(self, url=None):
+        target_url = url or PUSHINPAY_URLS["default"]
         async with self._lock:
-            while self._warm_pages:
-                wp = self._warm_pages.pop(0)
-                if wp.is_valid():
-                    asyncio.create_task(self._add_warm_page())
+            for i, wp in enumerate(self._warm_pages):
+                if wp.url == target_url and wp.is_valid():
+                    self._warm_pages.pop(i)
+                    asyncio.create_task(self._add_warm_page(target_url))
                     return wp.page
-                else:
-                    try:
-                        if not wp.page.is_closed(): await wp.page.close()
-                    except: pass
-        return await self._create_ready_page()
+        return await self._create_ready_page(target_url)
 
     async def close(self):
         self._running = False
@@ -169,7 +162,7 @@ class BrowserManager:
         if self.browser: await self.browser.close()
         if self.playwright: await self.playwright.stop()
 
-browser_manager = BrowserManager(pool_size=2)
+browser_manager = BrowserManager(pool_size=1)
 
 @app.on_event("startup")
 async def startup_event():
@@ -180,28 +173,21 @@ async def shutdown_event():
     await browser_manager.close()
 
 async def automate_pushinpay(data: PixRequest):
-    page = await browser_manager.get_ready_page()
+    url = PUSHINPAY_URLS.get(data.subtotal, PUSHINPAY_URLS["default"])
+    page = await browser_manager.get_ready_page(url)
     if not page: return None, "Erro ao carregar página de pagamento"
     
     try:
-        # Preenche os dados
-        await page.fill('input[name="name"]', data.payer_name)
-        await page.fill('input[name="cpf"]', data.payer_cpf)
-        await page.fill('input[name="phone"]', data.payer_phone)
+        checkbox = await page.query_selector('input[type="checkbox"]')
+        if checkbox: await checkbox.check()
         
-        # Clica no botão de gerar PIX (Geralmente o botão principal de submit)
-        # Na PushinPay costuma ser um botão que contém "Gerar" ou "Pagar"
-        await page.click('button[type="submit"]')
+        confirm_btn = await page.query_selector('button:has-text("Confirmar Pagamento")')
+        if confirm_btn: await confirm_btn.click()
         
-        # Aguarda o redirecionamento ou a exibição do QR Code
-        # O PushinPay geralmente redireciona para uma URL com o QR Code
         await page.wait_for_load_state('networkidle', timeout=15000)
-        
-        final_url = page.url
-        logger.info(f"Pagamento gerado: {final_url}")
-        return final_url, None
+        return page.url, None
     except Exception as e:
-        logger.error(f"Erro na automação PushinPay: {e}")
+        logger.error(f"Erro na automação: {e}")
         return None, str(e)
     finally:
         try: await page.close()
@@ -209,7 +195,7 @@ async def automate_pushinpay(data: PixRequest):
 
 @app.post('/proxy/pix')
 async def generate_pix(request: PixRequest):
-    logger.info(f"Gerando PIX para: {request.payer_name}")
+    logger.info(f"Requisição PIX: {request.payer_name}")
     pix_url, error = await automate_pushinpay(request)
     if pix_url:
         return JSONResponse({'success': True, 'pixUrl': pix_url})
@@ -219,9 +205,19 @@ async def generate_pix(request: PixRequest):
 async def health():
     return {"status": "ok", "pool": len(browser_manager._warm_pages)}
 
-@app.get('/')
-async def index():
-    return FileResponse(Path(__file__).parent / 'static' / 'index.html')
+# --- CONFIGURAÇÃO DE ARQUIVOS ESTÁTICOS ---
+# Importante: a rota '/' deve vir ANTES de montar o diretório static se você quiser servir o index.html na raiz
+BASE_DIR = Path(__file__).parent
+
+@app.get("/")
+async def read_index():
+    index_path = BASE_DIR / "static" / "index.html"
+    if index_path.exists():
+        return FileResponse(index_path)
+    return JSONResponse({"error": "index.html not found"}, status_code=404)
+
+# Monta o diretório static para servir CSS, JS, etc.
+app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
 if __name__ == '__main__':
     import uvicorn
