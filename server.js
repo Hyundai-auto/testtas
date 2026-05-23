@@ -14,82 +14,85 @@ app.post('/api/generate-pix', async (req, res) => {
     const { name, email, cpf } = req.body;
     const checkoutUrl = 'https://app.pushinpay.com.br/service/pay/A1D84A4C-312D-4A77-A804-4134784C458D';
 
+    console.log(`Iniciando geração de PIX para: ${email}`);
+
     let browser;
     try {
+        // Configurações específicas para rodar no Render/Heroku
         browser = await puppeteer.launch({
             headless: "new",
-            args: ['--no-sandbox', '--disable-setuid-sandbox']
+            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || null,
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--no-first-run',
+                '--no-zygote',
+                '--single-process',
+                '--disable-gpu'
+            ]
         });
+
         const page = await browser.newPage();
         
-        // Configurar User Agent para evitar bloqueios
+        // Bloquear recursos desnecessários para carregar mais rápido
+        await page.setRequestInterception(true);
+        page.on('request', (req) => {
+            if(['image', 'stylesheet', 'font'].includes(req.resourceType())){
+                req.abort();
+            } else {
+                req.continue();
+            }
+        });
+
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-        console.log(`Navegando para: ${checkoutUrl}`);
-        await page.goto(checkoutUrl, { waitUntil: 'networkidle2' });
+        console.log(`Navegando para o checkout...`);
+        await page.goto(checkoutUrl, { waitUntil: 'networkidle0', timeout: 60000 });
 
-        // Esperar e preencher campos se existirem (PushinPay às vezes pede dados antes)
-        // Mas no link fornecido, parece ser um checkout direto de produto.
-        
-        // 1. Aceitar termos se necessário
+        // Tentar clicar no checkbox de termos
         try {
-            const checkbox = await page.$('input[type="checkbox"]');
-            if (checkbox) {
-                await page.click('input[type="checkbox"]');
-                console.log('Checkbox de termos clicado.');
-            }
-        } catch (e) {}
+            await page.waitForSelector('input[type="checkbox"]', { timeout: 5000 });
+            await page.click('input[type="checkbox"]');
+        } catch (e) {
+            console.log("Checkbox não encontrado ou já marcado.");
+        }
 
-        // 2. Clicar no botão de confirmar pagamento
-        console.log('Clicando em Confirmar Pagamento...');
+        // Clicar no botão de pagamento
+        console.log("Clicando em confirmar pagamento...");
         await page.evaluate(() => {
             const buttons = Array.from(document.querySelectorAll('button'));
-            const payBtn = buttons.find(b => b.textContent.includes('Confirmar Pagamento'));
+            const payBtn = buttons.find(b => b.innerText.includes('CONFIRMAR') || b.innerText.includes('PAGAMENTO'));
             if (payBtn) payBtn.click();
         });
 
-        // 3. Esperar a geração do PIX e extrair o código
-        console.log('Aguardando código PIX...');
-        
-        // Aumentar o timeout pois a geração pode demorar
+        // Aguardar o código PIX aparecer
+        console.log("Aguardando código PIX...");
         await page.waitForFunction(() => {
-            // Procura por textos comuns de código PIX ou botões de copiar
-            const bodyText = document.body.innerText;
-            return bodyText.includes('000201') || document.querySelector('.pix-code') || document.querySelector('[copy]');
-        }, { timeout: 30000 });
+            return document.body.innerText.includes('000201');
+        }, { timeout: 45000 });
 
-        const pixData = await page.evaluate(() => {
-            // Tenta encontrar o código PIX "Copia e Cola"
-            // Geralmente começa com 000201
-            const bodyText = document.body.innerText;
-            const pixMatch = bodyText.match(/000201[a-zA-Z0-9]+/);
-            
-            // Tenta encontrar o QR Code (imagem ou canvas)
-            const qrImg = document.querySelector('img[src*="qr"], canvas');
-            const qrSource = qrImg ? (qrImg.src || qrImg.toDataURL()) : null;
-
-            return {
-                pix_code: pixMatch ? pixMatch[0] : null,
-                qr_code: qrSource
-            };
+        const pixCode = await page.evaluate(() => {
+            const match = document.body.innerText.match(/000201[a-zA-Z0-9]+/);
+            return match ? match[0] : null;
         });
 
-        if (pixData.pix_code) {
-            console.log('PIX gerado com sucesso!');
-            res.json(pixData);
+        if (pixCode) {
+            console.log("PIX extraído com sucesso!");
+            res.json({ pix_code: pixCode });
         } else {
-            console.log('Falha ao extrair código PIX.');
             res.status(400).json({ error: 'Não foi possível extrair o código PIX.' });
         }
 
     } catch (error) {
-        console.error('Erro no processamento:', error.message);
-        res.status(500).json({ error: 'Erro ao gerar o pagamento. Tente novamente.' });
+        console.error('Erro detalhado:', error);
+        res.status(500).json({ error: 'Erro ao processar pagamento: ' + error.message });
     } finally {
         if (browser) await browser.close();
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`Servidor rodando na porta ${PORT}`);
+    console.log(`Servidor ativo na porta ${PORT}`);
 });
