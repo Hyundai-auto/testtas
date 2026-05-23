@@ -19,7 +19,6 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# Configuração de CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -28,15 +27,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Handler para logar erros 422 (Unprocessable Entity)
+# Trava global para garantir que apenas UM navegador seja aberto por vez (evita crash de memória)
+concurrency_lock = asyncio.Lock()
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     body = await request.body()
     logger.error(f"Erro de validação 422: {exc.errors()}")
-    logger.error(f"Corpo da requisição recebido: {body.decode()}")
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content={"detail": exc.errors(), "body": body.decode()},
+        content={"detail": exc.errors()},
     )
 
 # ============================================================
@@ -46,14 +46,14 @@ PUSHINPAY_URLS = {
     "default": "https://app.pushinpay.com.br/service/pay/A1D84A4C-312D-4A77-A804-4134784C458D"
 }
 
-PAGE_MAX_AGE_SECONDS = 180
+PAGE_MAX_AGE_SECONDS = 300 # Aumentado para 5 minutos
 
 class PixRequest(BaseModel):
-    payer_name: Optional[str] = Field(None, alias="payer_name")
-    payer_cpf: Optional[str] = Field(None, alias="payer_cpf")
-    payer_phone: Optional[str] = Field(None, alias="payer_phone")
+    payer_name: Optional[str] = None
+    payer_cpf: Optional[str] = None
+    payer_phone: Optional[str] = None
     payer_email: Optional[str] = None
-    subtotal: Optional[Any] = None # Aceita string, float ou null
+    subtotal: Optional[Any] = None
 
 class PreWarmedPage:
     def __init__(self, page, created_at: float, url: str):
@@ -87,7 +87,14 @@ class BrowserManager:
             self.playwright = await async_playwright().start()
             self.browser = await self.playwright.chromium.launch(
                 headless=True,
-                args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process']
+                args=[
+                    '--no-sandbox', 
+                    '--disable-setuid-sandbox', 
+                    '--disable-dev-shm-usage', 
+                    '--disable-gpu', 
+                    '--single-process',
+                    '--js-flags="--max-old-space-size=256"' # Limita memória do JS
+                ]
             )
             self.context = await self.browser.new_context(
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
@@ -103,13 +110,12 @@ class BrowserManager:
 
     async def _initial_warmup(self):
         await asyncio.sleep(2)
-        for _ in range(self.pool_size):
-            await self._add_warm_page()
+        await self._add_warm_page()
 
     async def _pool_maintenance_loop(self):
         while self._running:
             try:
-                await asyncio.sleep(30)
+                await asyncio.sleep(60)
                 await self._cleanup_expired_pages()
                 await self._replenish_pool()
             except asyncio.CancelledError: break
@@ -129,8 +135,9 @@ class BrowserManager:
         self._warm_pages = valid_pages
 
     async def _replenish_pool(self):
-        while len(self._warm_pages) < self.pool_size:
-            await self._add_warm_page()
+        async with self._lock:
+            if len(self._warm_pages) < self.pool_size:
+                await self._add_warm_page()
 
     async def _add_warm_page(self, url=None):
         target_url = url or PUSHINPAY_URLS["default"]
@@ -147,7 +154,7 @@ class BrowserManager:
         if not self.context: return None
         page = await self.context.new_page()
         async def block_resources(route):
-            if route.request.resource_type in ["image", "font", "media"]:
+            if route.request.resource_type in ["image", "font", "media", "stylesheet"]:
                 return await route.abort()
             await route.continue_()
         await page.route("**/*", block_resources)
@@ -159,17 +166,15 @@ class BrowserManager:
         async with self._lock:
             for i, wp in enumerate(self._warm_pages):
                 if wp.url == target_url and wp.is_valid():
-                    self._warm_pages.pop(i)
+                    page = self._warm_pages.pop(i).page
+                    # Dispara reposição sem travar
                     asyncio.create_task(self._add_warm_page(target_url))
-                    return wp.page
+                    return page
         return await self._create_ready_page(target_url)
 
     async def close(self):
         self._running = False
         if self._maintenance_task: self._maintenance_task.cancel()
-        for wp in self._warm_pages:
-            try: await wp.page.close()
-            except: pass
         if self.context: await self.context.close()
         if self.browser: await self.browser.close()
         if self.playwright: await self.playwright.stop()
@@ -185,26 +190,29 @@ async def shutdown_event():
     await browser_manager.close()
 
 async def automate_pushinpay(data: PixRequest):
-    subtotal_str = str(data.subtotal) if data.subtotal else "default"
-    url = PUSHINPAY_URLS.get(subtotal_str, PUSHINPAY_URLS["default"])
-    page = await browser_manager.get_ready_page(url)
-    if not page: return None, "Erro ao carregar página de pagamento"
-    
-    try:
-        checkbox = await page.query_selector('input[type="checkbox"]')
-        if checkbox: await checkbox.check()
+    async with concurrency_lock: # Garante que apenas UM processo de automação ocorra por vez
+        url = PUSHINPAY_URLS.get(str(data.subtotal), PUSHINPAY_URLS["default"])
+        page = await browser_manager.get_ready_page(url)
+        if not page: return None, "Erro ao carregar página"
         
-        confirm_btn = await page.query_selector('button:has-text("Confirmar Pagamento")')
-        if confirm_btn: await confirm_btn.click()
-        
-        await page.wait_for_load_state('networkidle', timeout=15000)
-        return page.url, None
-    except Exception as e:
-        logger.error(f"Erro na automação: {e}")
-        return None, str(e)
-    finally:
-        try: await page.close()
-        except: pass
+        try:
+            # Aceita termos e clica
+            await page.evaluate("""() => {
+                const cb = document.querySelector('input[type="checkbox"]');
+                if(cb) cb.click();
+                const btn = Array.from(document.querySelectorAll('button')).find(b => b.innerText.includes('Confirmar'));
+                if(btn) btn.click();
+            }""")
+            
+            await page.wait_for_load_state('networkidle', timeout=10000)
+            final_url = page.url
+            return final_url, None
+        except Exception as e:
+            logger.error(f"Erro automação: {e}")
+            return None, str(e)
+        finally:
+            try: await page.close()
+            except: pass
 
 @app.post('/proxy/pix')
 async def generate_pix(request: PixRequest):
@@ -218,15 +226,10 @@ async def generate_pix(request: PixRequest):
 async def health():
     return {"status": "ok", "pool": len(browser_manager._warm_pages)}
 
-# --- CONFIGURAÇÃO DE ARQUIVOS ESTÁTICOS ---
 BASE_DIR = Path(__file__).parent
-
 @app.get("/")
 async def read_index():
-    index_path = BASE_DIR / "static" / "index.html"
-    if index_path.exists():
-        return FileResponse(index_path)
-    return JSONResponse({"error": "index.html not found"}, status_code=404)
+    return FileResponse(BASE_DIR / "static" / "index.html")
 
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
