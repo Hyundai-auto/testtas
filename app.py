@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import random
 from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, FileResponse
@@ -44,44 +45,33 @@ class BrowserManager:
         self.playwright = None
         self.browser = None
         self.context = None
-        self._warm_page = None
-        self._lock = asyncio.Lock()
 
     async def start(self):
         try:
             self.playwright = await async_playwright().start()
             self.browser = await self.playwright.chromium.launch(
                 headless=True,
-                args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--single-process']
+                args=[
+                    '--no-sandbox', 
+                    '--disable-setuid-sandbox', 
+                    '--disable-dev-shm-usage', 
+                    '--single-process',
+                    '--disable-blink-features=AutomationControlled'
+                ]
             )
+            # Contexto com User Agent realista para evitar bloqueios
             self.context = await self.browser.new_context(
+                viewport={'width': 1280, 'height': 800},
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
             )
             logger.info("Browser iniciado")
-            asyncio.create_task(self.pre_warm())
         except Exception as e:
             logger.error(f"Erro start: {e}")
 
-    async def pre_warm(self):
-        async with self._lock:
-            if self._warm_page: return
-            try:
-                page = await self.context.new_page()
-                await page.goto(PUSHINPAY_URL, wait_until='domcontentloaded', timeout=60000)
-                self._warm_page = page
-                logger.info("Página pré-aquecida pronta")
-            except Exception as e:
-                logger.error(f"Erro pre_warm: {e}")
-
-    async def get_page(self):
-        async with self._lock:
-            if self._warm_page:
-                page = self._warm_page
-                self._warm_page = None
-                asyncio.create_task(self.pre_warm())
-                return page
+    async def get_new_page(self):
         page = await self.context.new_page()
-        await page.goto(PUSHINPAY_URL, wait_until='domcontentloaded', timeout=60000)
+        # Não bloqueamos CSS nem JS para garantir que a página carregue 100% e o botão funcione
+        await page.goto(PUSHINPAY_URL, wait_until='networkidle', timeout=60000)
         return page
 
 browser_manager = BrowserManager()
@@ -92,62 +82,72 @@ async def startup_event():
 
 async def automate_pushinpay(data: PixRequest):
     async with concurrency_lock:
-        page = await browser_manager.get_page()
+        page = await browser_manager.get_new_page()
         try:
-            # 1. Clicar em Confirmar
-            await page.evaluate("""() => {
-                const cb = document.querySelector('input[type="checkbox"]');
-                if(cb) cb.click();
-                const btns = Array.from(document.querySelectorAll('button'));
-                const confirmBtn = btns.find(b => b.innerText.toUpperCase().includes('CONFIRMAR') || b.innerText.toUpperCase().includes('PAGAMENTO'));
-                if(confirmBtn) confirmBtn.click();
-            }""")
-            
-            # 2. Aguardar a geração do PIX
-            # Procuramos pelo código copia e cola ou QR Code
-            logger.info("Aguardando extração do PIX...")
-            
-            # Tenta encontrar o código copia e cola na página final
-            # Na PushinPay, geralmente há um input ou elemento com o código longo
-            pix_data = None
-            for _ in range(30): # Tenta por 30 segundos
-                pix_data = await page.evaluate("""() => {
-                    // Tenta encontrar o input que contém o código PIX (geralmente longo e começa com 000201)
-                    const inputs = Array.from(document.querySelectorAll('input, textarea'));
-                    const pixInput = inputs.find(i => i.value && i.value.startsWith('000201'));
-                    if(pixInput) return { code: pixInput.value };
-                    
-                    // Tenta encontrar por texto em algum elemento
-                    const allElements = Array.from(document.querySelectorAll('p, span, div'));
-                    const pixText = allElements.find(e => e.innerText && e.innerText.startsWith('000201'));
-                    if(pixText) return { code: pixText.innerText.trim() };
+            # 1. Pequeno delay para simular humano
+            await asyncio.sleep(random.uniform(1.5, 3.0))
 
-                    // Tenta encontrar o QR Code (imagem ou canvas)
-                    const qrImg = document.querySelector('img[src*="qr"], canvas');
-                    if(qrImg) {
-                        // Se achou o QR mas não o código, tenta esperar mais um pouco
-                        return { waiting: true };
-                    }
+            # 2. Clicar no checkbox de termos (usando seletor mais específico se possível)
+            # Na PushinPay o checkbox costuma ser um input ou uma label próxima
+            checkbox = await page.query_selector('input[type="checkbox"]')
+            if checkbox:
+                await checkbox.click()
+                logger.info("Checkbox de termos clicado")
+            else:
+                # Fallback: tenta clicar na label que contém o texto "Confirmo"
+                await page.evaluate("() => { const l = Array.from(document.querySelectorAll('label')).find(x => x.innerText.includes('Confirmo')); if(l) l.click(); }")
+
+            await asyncio.sleep(0.5)
+
+            # 3. Clicar no botão de Confirmar Pagamento
+            # Procuramos por um botão que contenha "Confirmar" ou "Pagamento"
+            confirm_btn = await page.query_selector('button:has-text("Confirmar"), button:has-text("PAGAMENTO")')
+            if confirm_btn:
+                await confirm_btn.click()
+                logger.info("Botão de confirmação clicado")
+            else:
+                # Fallback via JS
+                await page.evaluate("() => { const b = Array.from(document.querySelectorAll('button')).find(x => x.innerText.toUpperCase().includes('CONFIRMAR') || x.innerText.toUpperCase().includes('PAGAMENTO')); if(b) b.click(); }")
+
+            # 4. Aguardar o código PIX aparecer (ele aparece na mesma página ou redireciona)
+            logger.info("Aguardando código PIX...")
+            
+            pix_code = None
+            # Tentamos encontrar o código por até 30 segundos
+            for i in range(30):
+                pix_code = await page.evaluate("""() => {
+                    // 1. Procura em inputs/textareas (comum para copia e cola)
+                    const fields = Array.from(document.querySelectorAll('input, textarea, p, span, div'));
+                    const code = fields.find(f => {
+                        const val = f.value || f.innerText || "";
+                        return val.trim().startsWith('000201') && val.length > 50;
+                    });
+                    
+                    if(code) return code.value || code.innerText;
                     return null;
                 }""")
                 
-                if pix_data and pix_data.get('code'):
-                    logger.info("Código PIX extraído com sucesso!")
-                    return pix_data['code'], None
+                if pix_code:
+                    logger.info(f"PIX extraído na tentativa {i+1}")
+                    return pix_code.strip(), None
                 
                 await asyncio.sleep(1)
             
-            return None, "Não foi possível extrair o código PIX da página."
+            # Se falhar, tira um log da página para debug interno (Markdown do conteúdo)
+            content = await page.content()
+            logger.error(f"Falha ao encontrar PIX. Conteúdo parcial: {content[:500]}")
+            return None, "A página da PushinPay não gerou o código a tempo. Tente novamente."
 
         except Exception as e:
-            logger.error(f"Erro extração: {e}")
-            return None, str(e)
+            logger.error(f"Erro na automação: {e}")
+            return None, "Erro de conexão com o processador de pagamentos."
         finally:
             try: await page.close()
             except: pass
 
 @app.post('/proxy/pix')
 async def generate_pix(request: PixRequest):
+    logger.info(f"Iniciando processo para: {request.payer_name}")
     pix_code, error = await automate_pushinpay(request)
     if pix_code:
         return JSONResponse({'success': True, 'pixCode': pix_code})
