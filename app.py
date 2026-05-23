@@ -26,7 +26,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Lock para evitar sobrecarga de memória no Render (processa um por vez)
 concurrency_lock = asyncio.Lock()
 
 # ============================================================
@@ -53,12 +52,7 @@ class BrowserManager:
             self.playwright = await async_playwright().start()
             self.browser = await self.playwright.chromium.launch(
                 headless=True,
-                args=[
-                    '--no-sandbox', 
-                    '--disable-setuid-sandbox', 
-                    '--disable-dev-shm-usage', 
-                    '--single-process'
-                ]
+                args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--single-process']
             )
             self.context = await self.browser.new_context(
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
@@ -73,10 +67,9 @@ class BrowserManager:
             if self._warm_page: return
             try:
                 page = await self.context.new_page()
-                await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font"] else route.continue_())
                 await page.goto(PUSHINPAY_URL, wait_until='domcontentloaded', timeout=60000)
                 self._warm_page = page
-                logger.info("Pool: Página pronta")
+                logger.info("Página pré-aquecida pronta")
             except Exception as e:
                 logger.error(f"Erro pre_warm: {e}")
 
@@ -87,7 +80,6 @@ class BrowserManager:
                 self._warm_page = None
                 asyncio.create_task(self.pre_warm())
                 return page
-        
         page = await self.context.new_page()
         await page.goto(PUSHINPAY_URL, wait_until='domcontentloaded', timeout=60000)
         return page
@@ -102,66 +94,64 @@ async def automate_pushinpay(data: PixRequest):
     async with concurrency_lock:
         page = await browser_manager.get_page()
         try:
-            # 1. Tenta preencher dados se os campos estiverem visíveis
-            # Usamos um script JS para detectar e preencher Nome, CPF e Telefone se existirem
-            await page.evaluate(f"""(d) => {{
-                const inputs = Array.from(document.querySelectorAll('input'));
-                
-                // Busca campos por placeholder ou label aproximada
-                const nameInput = inputs.find(i => i.placeholder?.toLowerCase().includes('nome') || i.name?.toLowerCase().includes('name'));
-                const cpfInput = inputs.find(i => i.placeholder?.toLowerCase().includes('cpf') || i.name?.toLowerCase().includes('cpf'));
-                const phoneInput = inputs.find(i => i.placeholder?.toLowerCase().includes('tel') || i.placeholder?.toLowerCase().includes('cel') || i.name?.toLowerCase().includes('phone'));
-
-                if(nameInput && d.payer_name) {{ nameInput.value = d.payer_name; nameInput.dispatchEvent(new Event('input', {{ bubbles: true }})); }}
-                if(cpfInput && d.payer_cpf) {{ cpfInput.value = d.payer_cpf; cpfInput.dispatchEvent(new Event('input', {{ bubbles: true }})); }}
-                if(phoneInput && d.payer_phone) {{ phoneInput.value = d.payer_phone; phoneInput.dispatchEvent(new Event('input', {{ bubbles: true }})); }}
-
-                // Clica no checkbox de termos
+            # 1. Clicar em Confirmar
+            await page.evaluate("""() => {
                 const cb = document.querySelector('input[type="checkbox"]');
                 if(cb) cb.click();
-
-                // Clica no botão de confirmar
                 const btns = Array.from(document.querySelectorAll('button'));
                 const confirmBtn = btns.find(b => b.innerText.toUpperCase().includes('CONFIRMAR') || b.innerText.toUpperCase().includes('PAGAMENTO'));
                 if(confirmBtn) confirmBtn.click();
-            }}""", {"payer_name": data.payer_name, "payer_cpf": data.payer_cpf, "payer_phone": data.payer_phone})
-
-            # 2. Aguarda a mudança de URL ou carregamento do QR Code
-            # Aumentamos para 35 segundos para ser extremamente resiliente no Render
-            logger.info("Aguardando geração do PIX...")
-            await page.wait_for_load_state('networkidle', timeout=35000)
+            }""")
             
-            final_url = page.url
-            if final_url != PUSHINPAY_URL:
-                logger.info(f"Sucesso! Redirecionando para: {final_url}")
-                return final_url, None
-            else:
-                # Se a URL não mudou, talvez o QR Code apareceu na mesma página
-                # Verificamos se há algum elemento de PIX ou QR Code
-                has_pix = await page.evaluate("() => document.body.innerText.includes('PIX') || !!document.querySelector('canvas') || !!document.querySelector('img[src*=\"qr\"]')")
-                if has_pix:
-                    return final_url, None
+            # 2. Aguardar a geração do PIX
+            # Procuramos pelo código copia e cola ou QR Code
+            logger.info("Aguardando extração do PIX...")
+            
+            # Tenta encontrar o código copia e cola na página final
+            # Na PushinPay, geralmente há um input ou elemento com o código longo
+            pix_data = None
+            for _ in range(30): # Tenta por 30 segundos
+                pix_data = await page.evaluate("""() => {
+                    // Tenta encontrar o input que contém o código PIX (geralmente longo e começa com 000201)
+                    const inputs = Array.from(document.querySelectorAll('input, textarea'));
+                    const pixInput = inputs.find(i => i.value && i.value.startsWith('000201'));
+                    if(pixInput) return { code: pixInput.value };
+                    
+                    // Tenta encontrar por texto em algum elemento
+                    const allElements = Array.from(document.querySelectorAll('p, span, div'));
+                    const pixText = allElements.find(e => e.innerText && e.innerText.startsWith('000201'));
+                    if(pixText) return { code: pixText.innerText.trim() };
+
+                    // Tenta encontrar o QR Code (imagem ou canvas)
+                    const qrImg = document.querySelector('img[src*="qr"], canvas');
+                    if(qrImg) {
+                        // Se achou o QR mas não o código, tenta esperar mais um pouco
+                        return { waiting: true };
+                    }
+                    return null;
+                }""")
                 
-                return None, "A página não processou o pagamento. Verifique os dados."
+                if pix_data and pix_data.get('code'):
+                    logger.info("Código PIX extraído com sucesso!")
+                    return pix_data['code'], None
+                
+                await asyncio.sleep(1)
+            
+            return None, "Não foi possível extrair o código PIX da página."
 
         except Exception as e:
-            logger.error(f"Erro na automação: {e}")
-            return None, "O sistema demorou a responder. Tente novamente em instantes."
+            logger.error(f"Erro extração: {e}")
+            return None, str(e)
         finally:
             try: await page.close()
             except: pass
 
 @app.post('/proxy/pix')
 async def generate_pix(request: PixRequest):
-    logger.info(f"Iniciando geração PIX para: {request.payer_name}")
-    pix_url, error = await automate_pushinpay(request)
-    if pix_url:
-        return JSONResponse({'success': True, 'pixUrl': pix_url})
+    pix_code, error = await automate_pushinpay(request)
+    if pix_code:
+        return JSONResponse({'success': True, 'pixCode': pix_code})
     return JSONResponse({'success': False, 'error': error}, status_code=400)
-
-@app.get('/health')
-async def health():
-    return {"status": "ok"}
 
 BASE_DIR = Path(__file__).parent
 @app.get("/")
