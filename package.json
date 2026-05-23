@@ -1,11 +1,10 @@
 {
-  "name": "checkout-emulation",
-  "version": "3.0.0",
-  "description": "Emulação de Checkout em Background",
+  "name": "checkout-docker",
+  "version": "4.0.0",
+  "description": "Checkout Emulation via Docker",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "build": "./build.sh"
+    "start": "node server.js"
   },
   "dependencies": {
     "puppeteer": "^21.6.0",
