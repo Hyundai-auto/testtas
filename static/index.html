@@ -1041,18 +1041,6 @@ let currentPixValue = 'R$ 20,00'; // Valor padrão caso não venha na URL
             }
         });
 
-        // ==================== INPUTS ENTREGA (Modal) ====================
-        const deliveryCpfInput = document.getElementById('delivery-cpf');
-        const deliveryPhoneInput = document.getElementById('delivery-phone');
-
-        deliveryCpfInput.addEventListener('input', e => {
-            e.target.value = maskCPF(e.target.value);
-        });
-
-        deliveryPhoneInput.addEventListener('input', e => {
-            e.target.value = maskPhone(e.target.value);
-        });
-
         // ==================== SELEÇÃO DE CARDS ====================
         const pixCard = document.getElementById('pay-now-pix');
         const deliveryCard = document.getElementById('pay-on-delivery');
@@ -1095,10 +1083,12 @@ let currentPixValue = 'R$ 20,00'; // Valor padrão caso não venha na URL
             }
         });
 
-        // ==================== GERAÇÃO PIX (funcionalidade original) ====================
-        document.getElementById('btn-generate').addEventListener('click', generatePix);
+        // ==================== GERAÇÃO PIX ====================
+        let isProcessing = false;
 
         async function generatePix() {
+    if (isProcessing) return; // Evita cliques duplos
+
     const name = document.getElementById('name').value;
     const cpf = document.getElementById('cpf').value;
     const phone = document.getElementById('phone').value;
@@ -1111,6 +1101,7 @@ let currentPixValue = 'R$ 20,00'; // Valor padrão caso não venha na URL
         return;
     }
 
+    isProcessing = true;
     const loadingModal = document.getElementById('loading-modal');
     const loadingProgress = document.getElementById('loading-progress');
     const loadingStatus = document.getElementById('loading-status');
@@ -1125,11 +1116,9 @@ let currentPixValue = 'R$ 20,00'; // Valor padrão caso não venha na URL
     errorEl.classList.remove('visible');
 
     try {
-        // Captura o subtotal
         const pixUrlParams = new URLSearchParams(window.location.search);
         const subtotal = pixUrlParams.get('subtotal') || null;
 
-        // Inicia a requisição IMEDIATAMENTE
         loadingProgress.style.width = '60%';
         loadingStatus.textContent = 'Gerando PIX, aguarde...';
 
@@ -1147,26 +1136,23 @@ let currentPixValue = 'R$ 20,00'; // Valor padrão caso não venha na URL
         const data = await response.json();
 
         if (data.success && data.pixUrl) {
-            // Sucesso! Redireciona imediatamente.
             loadingProgress.style.width = '100%';
             loadingStatus.textContent = 'Preparando...';
             window.location.href = data.pixUrl;
         } else {
-            // Tratamento de erro
-            loadingModal.classList.remove('active');
-            btnGenerate.disabled = false;
-            btnGenerate.innerHTML = `<span class="btn-text">Pagar Agora ${currentPixValue} <i class="fas fa-check-circle" style="margin-left: 5px;"></i></span>`;
-            errorText.textContent = data.error || 'Erro ao gerar PIX. Tente novamente.';
-            errorEl.classList.add('visible');
+            throw new Error(data.error || 'Erro ao gerar PIX');
         }
     } catch (err) {
+        isProcessing = false;
         loadingModal.classList.remove('active');
         btnGenerate.disabled = false;
         btnGenerate.innerHTML = `<span class="btn-text">Pagar Agora ${currentPixValue} <i class="fas fa-check-circle" style="margin-left: 5px;"></i></span>`;
-        errorText.textContent = 'Erro de conexão. Tente novamente.';
+        errorText.textContent = err.message || 'Erro de conexão. Tente novamente.';
         errorEl.classList.add('visible');
     }
 }
+
+document.getElementById('btn-generate').addEventListener('click', generatePix);
 
         // ==================== MODAL ENTREGA ====================
         function showDeliveryModal() {
