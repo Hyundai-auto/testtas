@@ -6,7 +6,6 @@
     <title>Checkout Seguro | Pagamento PIX</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <style>
-        /* Estilos baseados no original */
         :root {
             --primary: #0055ff;
             --primary-dark: #0033cc;
@@ -16,7 +15,6 @@
             --text-gray: #555;
             --border-color: #e0e4e8;
             --success: #28a745;
-            --danger: #ff3b30;
         }
 
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -27,7 +25,6 @@
         .content { padding: 24px; }
         
         .order-summary { background: #f8fafc; border-radius: 12px; padding: 15px; margin-bottom: 20px; display: flex; gap: 15px; align-items: center; }
-        .order-img { width: 60px; height: 60px; background: #eee; border-radius: 8px; }
         .order-info h3 { font-size: 1rem; }
         .order-info p { color: var(--primary); font-weight: bold; }
 
@@ -38,12 +35,11 @@
 
         .btn-pay { width: 100%; background: var(--primary); color: white; border: none; padding: 16px; border-radius: 12px; font-size: 1.1rem; font-weight: 800; cursor: pointer; transition: 0.3s; margin-top: 10px; }
         .btn-pay:hover { background: var(--primary-dark); transform: translateY(-2px); }
-        .btn-pay:disabled { background: #ccc; cursor: not-allowed; }
 
-        /* Pix Section */
         #pix-section { display: none; text-align: center; animation: fadeIn 0.5s; }
-        .pix-box { background: #f0f7ff; border: 2px dashed var(--primary); border-radius: 15px; padding: 20px; margin-top: 20px; }
-        .pix-code { font-family: monospace; font-size: 0.8rem; word-break: break-all; background: white; padding: 10px; border-radius: 8px; margin: 15px 0; border: 1px solid #ddd; }
+        .pix-box { background: #f0f7ff; border: 2px dashed var(--primary); border-radius: 15px; padding: 20px; margin-top: 10px; }
+        .qr-code-img { width: 200px; height: 200px; margin: 10px auto; background: white; padding: 10px; border-radius: 10px; }
+        .pix-code { font-family: monospace; font-size: 0.75rem; word-break: break-all; background: white; padding: 10px; border-radius: 8px; margin: 15px 0; border: 1px solid #ddd; max-height: 80px; overflow-y: auto; }
         .btn-copy { background: #FFC107; color: #000; border: none; padding: 12px 20px; border-radius: 25px; font-weight: bold; cursor: pointer; width: 100%; }
         
         .loading { display: none; flex-direction: column; align-items: center; gap: 10px; margin: 20px 0; }
@@ -56,16 +52,15 @@
 <body>
     <div class="container">
         <div class="header">
-            <h2>Finalizar Pagamento</h2>
+            <h2>Checkout Seguro</h2>
         </div>
         
         <div class="content">
             <div id="checkout-form">
                 <div class="order-summary">
-                    <div class="order-img"></div>
                     <div class="order-info">
                         <h3>Produto Digital</h3>
-                        <p>R$ 20,00</p>
+                        <p>Valor: R$ 20,00</p>
                     </div>
                 </div>
 
@@ -82,30 +77,22 @@
                     <input type="text" id="cpf" placeholder="000.000.000-00" required>
                 </div>
 
-                <button class="btn-pay" id="btn-pay">
-                    <span id="btn-text">GERAR PIX AGORA</span>
-                </button>
+                <button class="btn-pay" id="btn-pay">GERAR PIX</button>
 
                 <div class="loading" id="loading">
                     <div class="spinner"></div>
-                    <p>Processando seu pagamento...</p>
+                    <p>Gerando seu PIX...</p>
                 </div>
             </div>
 
             <div id="pix-section">
                 <div class="pix-box">
-                    <i class="fa-brands fa-pix" style="font-size: 2rem; color: var(--primary); margin-bottom: 10px;"></i>
-                    <h4>Pagamento via PIX</h4>
-                    <p style="font-size: 0.9rem; color: var(--text-gray); margin-top: 5px;">Copie o código abaixo para pagar no seu banco.</p>
-                    
+                    <img id="qr-code-img" class="qr-code-img" src="" alt="QR Code PIX">
                     <div class="pix-code" id="pix-code-text"></div>
-                    
-                    <button class="btn-copy" onclick="copyPix()">
-                        <i class="fa-regular fa-copy"></i> COPIAR CÓDIGO PIX
-                    </button>
+                    <button class="btn-copy" onclick="copyPix()">COPIAR CÓDIGO PIX</button>
                 </div>
                 <p style="margin-top: 20px; font-size: 0.8rem; color: var(--text-gray);">
-                    <i class="fa-solid fa-shield-halved"></i> Pagamento processado de forma segura.
+                    <i class="fa-solid fa-shield-halved"></i> Pagamento Seguro
                 </p>
             </div>
         </div>
@@ -117,6 +104,7 @@
         const pixSection = document.getElementById('pix-section');
         const loading = document.getElementById('loading');
         const pixCodeDisplay = document.getElementById('pix-code-text');
+        const qrImg = document.getElementById('qr-code-img');
 
         btnPay.addEventListener('click', async () => {
             const name = document.getElementById('name').value;
@@ -124,11 +112,10 @@
             const cpf = document.getElementById('cpf').value;
 
             if (!name || !email || !cpf) {
-                alert('Por favor, preencha todos os campos.');
+                alert('Preencha todos os campos.');
                 return;
             }
 
-            // Esconder botão e mostrar loading
             btnPay.style.display = 'none';
             loading.style.display = 'flex';
 
@@ -143,6 +130,7 @@
 
                 if (data.pix_code) {
                     pixCodeDisplay.innerText = data.pix_code;
+                    qrImg.src = data.qr_code_base64 || '';
                     checkoutForm.style.display = 'none';
                     pixSection.style.display = 'block';
                 } else {
@@ -158,7 +146,7 @@
         function copyPix() {
             const code = pixCodeDisplay.innerText;
             navigator.clipboard.writeText(code).then(() => {
-                alert('Código PIX copiado com sucesso!');
+                alert('Código PIX copiado!');
             });
         }
     </script>
