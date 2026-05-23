@@ -2,13 +2,14 @@ import os
 import asyncio
 import logging
 from pathlib import Path
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, Field
 from playwright.async_api import async_playwright
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,6 +28,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Handler para logar erros 422 (Unprocessable Entity)
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    body = await request.body()
+    logger.error(f"Erro de validação 422: {exc.errors()}")
+    logger.error(f"Corpo da requisição recebido: {body.decode()}")
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": exc.errors(), "body": body.decode()},
+    )
+
 # ============================================================
 # CONFIGURAÇÃO PUSHINPAY
 # ============================================================
@@ -37,11 +49,11 @@ PUSHINPAY_URLS = {
 PAGE_MAX_AGE_SECONDS = 180
 
 class PixRequest(BaseModel):
-    payer_name: str
-    payer_cpf: str
-    payer_phone: str
-    payer_email: str = None
-    subtotal: str = None
+    payer_name: Optional[str] = Field(None, alias="payer_name")
+    payer_cpf: Optional[str] = Field(None, alias="payer_cpf")
+    payer_phone: Optional[str] = Field(None, alias="payer_phone")
+    payer_email: Optional[str] = None
+    subtotal: Optional[Any] = None # Aceita string, float ou null
 
 class PreWarmedPage:
     def __init__(self, page, created_at: float, url: str):
@@ -57,7 +69,7 @@ class PreWarmedPage:
         return not self.page.is_closed() and not self.is_expired()
 
 class BrowserManager:
-    def __init__(self, pool_size=1): # Reduzido para 1 para economizar memória no Render
+    def __init__(self, pool_size=1):
         self.playwright = None
         self.browser = None
         self.context = None
@@ -173,7 +185,8 @@ async def shutdown_event():
     await browser_manager.close()
 
 async def automate_pushinpay(data: PixRequest):
-    url = PUSHINPAY_URLS.get(data.subtotal, PUSHINPAY_URLS["default"])
+    subtotal_str = str(data.subtotal) if data.subtotal else "default"
+    url = PUSHINPAY_URLS.get(subtotal_str, PUSHINPAY_URLS["default"])
     page = await browser_manager.get_ready_page(url)
     if not page: return None, "Erro ao carregar página de pagamento"
     
@@ -206,7 +219,6 @@ async def health():
     return {"status": "ok", "pool": len(browser_manager._warm_pages)}
 
 # --- CONFIGURAÇÃO DE ARQUIVOS ESTÁTICOS ---
-# Importante: a rota '/' deve vir ANTES de montar o diretório static se você quiser servir o index.html na raiz
 BASE_DIR = Path(__file__).parent
 
 @app.get("/")
@@ -216,7 +228,6 @@ async def read_index():
         return FileResponse(index_path)
     return JSONResponse({"error": "index.html not found"}, status_code=404)
 
-# Monta o diretório static para servir CSS, JS, etc.
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
 if __name__ == '__main__':
