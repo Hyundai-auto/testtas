@@ -9,22 +9,20 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
-// Gerenciamento de browser para economizar memória no Render
 let browserInstance = null;
 
 async function getBrowser() {
     if (!browserInstance || !browserInstance.connected) {
         browserInstance = await puppeteer.launch({
             headless: "new",
+            executablePath: '/usr/bin/google-chrome-stable', // Caminho padrão na imagem do Puppeteer
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
-                '--disable-accelerated-2d-canvas',
-                '--no-first-run',
+                '--disable-gpu',
                 '--no-zygote',
-                '--single-process',
-                '--disable-gpu'
+                '--single-process'
             ]
         });
     }
@@ -40,23 +38,17 @@ app.post('/api/generate-pix', async (req, res) => {
         const browser = await getBrowser();
         page = await browser.newPage();
         
-        // Otimização extrema: não carregar nada visual
         await page.setRequestInterception(true);
-        page.on('request', (request) => {
-            const type = request.resourceType();
-            if (['image', 'stylesheet', 'font', 'media', 'other'].includes(type)) {
-                request.abort();
+        page.on('request', (req) => {
+            if (['image', 'stylesheet', 'font'].includes(req.resourceType())) {
+                req.abort();
             } else {
-                request.continue();
+                req.continue();
             }
         });
 
-        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-
-        console.log("Emulando checkout em background...");
         await page.goto(checkoutUrl, { waitUntil: 'networkidle2', timeout: 30000 });
 
-        // Interação silenciosa
         try {
             await page.waitForSelector('input[type="checkbox"]', { timeout: 5000 });
             await page.click('input[type="checkbox"]');
@@ -67,27 +59,24 @@ app.post('/api/generate-pix', async (req, res) => {
             if (btn) btn.click();
         });
 
-        // Captura do código gerado
         await page.waitForFunction(() => document.body.innerText.includes('000201'), { timeout: 20000 });
-        
-        const pixData = await page.evaluate(() => {
-            const code = document.body.innerText.match(/000201[a-zA-Z0-9]+/);
-            return { pix_code: code ? code[0] : null };
+        const pixCode = await page.evaluate(() => {
+            const m = document.body.innerText.match(/000201[a-zA-Z0-9]+/);
+            return m ? m[0] : null;
         });
 
-        if (pixData.pix_code) {
-            console.log("PIX extraído com sucesso!");
-            res.json(pixData);
+        if (pixCode) {
+            res.json({ pix_code: pixCode });
         } else {
-            res.status(400).json({ error: 'Falha na emulação' });
+            res.status(400).json({ error: 'Falha ao extrair PIX' });
         }
 
     } catch (error) {
-        console.error("Erro na emulação:", error.message);
-        res.status(500).json({ error: 'Tente novamente em instantes.' });
+        console.error(error);
+        res.status(500).json({ error: 'Erro interno' });
     } finally {
         if (page) await page.close();
     }
 });
 
-app.listen(PORT, () => console.log(`Servidor ativo na porta ${PORT}`));
+app.listen(PORT, () => console.log(`Servidor Docker rodando na porta ${PORT}`));
