@@ -1,18 +1,15 @@
 {
-  "name": "checkout-proxy",
-  "version": "1.0.1",
-  "description": "Proxy otimizado para Render - Extração de PIX PushinPay",
+  "name": "checkout-emulation",
+  "version": "3.0.0",
+  "description": "Emulação de Checkout em Background",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "build": "./render-build.sh"
+    "build": "./build.sh"
   },
   "dependencies": {
     "puppeteer": "^21.6.0",
     "cors": "^2.8.5",
     "express": "^4.18.2"
-  },
-  "engines": {
-    "node": ">=18.0.0"
   }
 }
